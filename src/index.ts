@@ -25,6 +25,12 @@ export interface ChildTool {
   handler: (args: any) => Promise<any>;
 }
 
+export type RouterEvent = 
+  | { type: "tool_call"; tool: string; input?: any }
+  | { type: "tool_result"; tool: string; result: any }
+  | { type: "final_answer"; text: string }
+  | { type: "error"; message: string };
+
 export class SmartRouterMCP {
   private server: Server;
   private childTools: Map<string, ChildTool> = new Map();
@@ -95,80 +101,107 @@ export class SmartRouterMCP {
    * Core Agentic Loop: 
    * Uses Cloudflare AI to evaluate the prompt against the registered child tools,
    * decides which tools to call, executes them locally, and synthesizes a final response.
+   * This is a convenience method that exhausts the stream and returns the final answer.
    */
   private async routeAndExecute(prompt: string, context?: string): Promise<string> {
-    // 1. Build tool definitions for the LLM
-    const availableTools = Array.from(this.childTools.values()).map((t) => ({
+    let finalAnswer = "Task completed.";
+    for await (const event of this.executeTaskStream(prompt, context)) {
+      if (event.type === "final_answer") {
+        finalAnswer = event.text;
+      } else if (event.type === "error") {
+        return `Error: ${event.message}`;
+      }
+    }
+    return finalAnswer;
+  }
+
+  /**
+   * Streaming Agentic Loop:
+   * Yields execution state events back to the caller for UI rendering (e.g. SSE)
+   */
+  public async *executeTaskStream(prompt: string, context?: string): AsyncGenerator<RouterEvent, void, unknown> {
+    const tools = Array.from(this.childTools.values()).map((t) => ({
       name: t.name,
       description: t.description,
-      input_schema: t.inputSchema,
+      parameters: t.inputSchema,
     }));
 
-    // 2. Create the system prompt with tool knowledge
-    const systemPrompt = `You are the Multinex Smart Router. You have access to the following tools:
-${JSON.stringify(availableTools, null, 2)}
+    const systemPrompt = `You are the Multinex Smart Router. You have access to a set of internal tools. 
+Your job is to solve the user's task using the tools provided. If no tools are needed or you have finished, provide the final answer. Keep your final answer concise and helpful.`;
 
-Your job is to solve the user's task. You must output a JSON object containing the tool to call and its arguments, OR a final answer.
-Format:
-{
-  "action": "call_tool" | "final_answer",
-  "tool": "tool_name",
-  "arguments": { ... },
-  "answer": "The final result if action is final_answer"
-}`;
+    const messages: any[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: prompt + (context ? `\nContext: ${context}` : "") }
+    ];
 
-    let currentPrompt = prompt + (context ? `\nContext: ${context}` : "");
     let maxIterations = 5;
     let iteration = 0;
-    
-    // Simplistic ReAct loop
+
     while (iteration < maxIterations) {
       iteration++;
 
-      // Invoke Cloudflare AI Gateway
-      const response = await this.config.env.AI.run(
-        this.config.defaultModel,
-        {
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: currentPrompt },
-          ],
-        },
-        { gateway: { id: this.config.gatewayId } }
-      );
-
-      let llmOutput = response.response;
-      
       try {
-        // Strip markdown code blocks if the LLM wrapped the JSON
-        const jsonMatch = llmOutput.match(/\{[\s\S]*\}/);
-        if (jsonMatch) llmOutput = jsonMatch[0];
-        
-        const decision = JSON.parse(llmOutput);
-
-        if (decision.action === "final_answer") {
-          return decision.answer || "Task completed.";
+        const aiPayload: any = { messages };
+        if (tools.length > 0) {
+          aiPayload.tools = tools;
         }
 
-        if (decision.action === "call_tool" && decision.tool) {
-          const tool = this.childTools.get(decision.tool);
-          if (!tool) {
-            currentPrompt += `\nSystem: Tool '${decision.tool}' not found. Try again.`;
-            continue;
+        const response = await this.config.env.AI.run(
+          this.config.defaultModel,
+          aiPayload,
+          { gateway: { id: this.config.gatewayId } }
+        );
+
+        if (response.tool_calls && response.tool_calls.length > 0) {
+          // Model decided to call tools
+          messages.push({
+            role: "assistant",
+            tool_calls: response.tool_calls
+          });
+
+          for (const call of response.tool_calls) {
+            yield { type: "tool_call", tool: call.name, input: call.arguments };
+            
+            const tool = this.childTools.get(call.name);
+            let toolResultStr = "";
+
+            if (!tool) {
+              toolResultStr = JSON.stringify({ error: `Tool ${call.name} not found.` });
+            } else {
+              try {
+                // Workers AI tool calls might return arguments as object or string
+                const args = typeof call.arguments === "string" ? JSON.parse(call.arguments) : call.arguments;
+                const rawResult = await tool.handler(args || {});
+                toolResultStr = JSON.stringify(rawResult);
+                yield { type: "tool_result", tool: call.name, result: rawResult };
+              } catch (e: any) {
+                toolResultStr = JSON.stringify({ error: e.message });
+                yield { type: "tool_result", tool: call.name, result: { error: e.message } };
+              }
+            }
+
+            messages.push({
+              role: "tool",
+              name: call.name,
+              content: toolResultStr
+            });
           }
-
-          // Execute the local tool handler
-          const toolResult = await tool.handler(decision.arguments || {});
-          
-          // Feed result back to the LLM
-          currentPrompt += `\nTool '${decision.tool}' returned: ${JSON.stringify(toolResult)}`;
+        } else if (response.response) {
+          // Model provided a final text answer
+          yield { type: "final_answer", text: response.response };
+          return;
+        } else {
+          yield { type: "error", message: "Unexpected empty response from model." };
+          return;
         }
+
       } catch (err: any) {
-        currentPrompt += `\nSystem: Failed to parse your JSON or execute tool: ${err.message}. Please output strictly valid JSON matching the format.`;
+        yield { type: "error", message: err.message || "Failed to execute AI request." };
+        return;
       }
     }
 
-    return "Error: Reached maximum iterations without completing the task.";
+    yield { type: "error", message: "Reached maximum iterations without completing the task." };
   }
 
   /**
